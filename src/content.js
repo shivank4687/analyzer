@@ -1,6 +1,61 @@
 var MessageType = {
   PRICE_UPDATE: "PRICE_UPDATE",
 };
+
+// Snapshot holders
+let lastBuySnapshot = [];
+let lastSellSnapshot = [];
+
+function createAnalysisSnapshot({
+  price,
+  trades,
+  orderBook,
+  marketStats,
+  timestamp = Date.now(),
+}) {
+  const buyTrades = trades.filter((t) => t.direction === "buy");
+  const sellTrades = trades.filter((t) => t.direction === "sell");
+  const totalSize = trades.reduce((sum, t) => sum + t.size, 0);
+  const buySize = buyTrades.reduce((sum, t) => sum + t.size, 0);
+  const sellSize = sellTrades.reduce((sum, t) => sum + t.size, 0);
+  const buyRatio = totalSize ? (buySize / totalSize) * 100 : 0;
+
+  const spread =
+    orderBook.topAsk?.price && orderBook.topBid?.price
+      ? orderBook.topAsk.price - orderBook.topBid.price
+      : null;
+
+  return {
+    timestamp,
+    price,
+
+    volume: {
+      totalSize,
+      buySize,
+      sellSize,
+      buyRatio: Number(buyRatio.toFixed(2)),
+      recentTrades: trades,
+    },
+
+    orderBook: {
+      ...orderBook,
+      spread,
+      imbalance:
+        orderBook.buyDepth + orderBook.sellDepth
+          ? (orderBook.buyDepth / (orderBook.buyDepth + orderBook.sellDepth)) *
+            100
+          : 0,
+    },
+    marketStats,
+    // signals: {
+    //   buyPressure: buyRatio > 70,
+    //   spoofingDetected: detectSpoofing(orderBook.changes),
+    //   wallMovement: detectWallMovement(orderBook.changes),
+    //   momentum: detectMomentum(price), // basic price velocity trend
+    // },
+  };
+}
+
 function monitorPrices() {
   if (window.StockAnalysisContentScriptLoaded) return;
   window.StockAnalysisContentScriptLoaded = true;
@@ -21,11 +76,19 @@ function monitorPrices() {
       .map((row) => {
         const cells = row.querySelectorAll("td");
         if (cells.length < 4) return null;
+        const price = parseFloat(cells[0].innerText);
+        const takerText = cells[1].innerText.trim().toLowerCase();
+        const size = parseFloat(cells[2].innerText);
+        const timeStr = cells[3].innerText.trim(); // e.g. "10:23:45"
+
+        // Parse time string to epoch
+        const time = parseTimeToEpoch(timeStr) || now;
         return {
-          price: parseFloat(cells[0].innerText),
-          taker: cells[1].innerText.trim(),
-          size: parseFloat(cells[2].innerText),
-          time: cells[3].innerText.trim(),
+          price,
+          size,
+          direction: takerText === "buy" ? "buy" : "sell",
+          isBuyer: takerText === "buy",
+          time,
         };
       })
       .filter(Boolean);
@@ -55,7 +118,9 @@ function monitorPrices() {
 
       all_prices.push(lastDataPoint);
       notifyUpdate(lastDataPoint);
+      return lastDataPoint;
     }
+    return null;
   }
 
   function syncPriceAndTrades(priceSelector, tradeTableSelector) {
@@ -66,16 +131,27 @@ function monitorPrices() {
     }
 
     // Initial extraction
-    latestPrice = extractPrice(priceSelector);
-    recentTrades = extractRecentTrades(tradeTableSelector);
-    updatePrices(latestPrice);
+    // latestPrice = extractPrice(priceSelector);
+    // recentTrades = extractRecentTrades(tradeTableSelector);
+    // updatePrices(latestPrice);
     const observer = new MutationObserver(() => {
       const newPrice = extractPrice(priceSelector);
 
       if (newPrice !== latestPrice) {
-        updatePrices(newPrice);
+        let latestPoint = updatePrices(newPrice);
+        if (latestPoint) {
+          recentTrades = extractRecentTrades(tradeTableSelector);
+          const orderBook = getOrderBookSnapshot();
+          const marketStats = extractHeaderStats();
+          const snapshot = createAnalysisSnapshot({
+            price: lastDataPoint.numericValue,
+            orderBook,
+            trades: recentTrades,
+            marketStats,
+          });
+          console.log(snapshot);
+        }
         latestPrice = newPrice;
-        recentTrades = extractRecentTrades(tradeTableSelector);
       }
     });
 
@@ -165,11 +241,7 @@ function compareOrderBooks(prev, current) {
   return changes;
 }
 
-// Snapshot holders
-let lastBuySnapshot = [];
-let lastSellSnapshot = [];
-
-function trackOrderBook() {
+function getOrderBookSnapshot() {
   const buyOrders = extractOrderBookRows("buy").map((o) => ({
     ...o,
     side: "buy",
@@ -181,17 +253,33 @@ function trackOrderBook() {
 
   const buyChanges = compareOrderBooks(lastBuySnapshot, buyOrders);
   const sellChanges = compareOrderBooks(lastSellSnapshot, sellOrders);
-
-  if (buyChanges.length > 0 || sellChanges.length > 0) {
-    console.log("Order Book Movement:", [...buyChanges, ...sellChanges]);
-    // You can optionally trigger a callback or send this to background script/storage
-  }
-
   lastBuySnapshot = buyOrders;
   lastSellSnapshot = sellOrders;
-}
+  const topBid = buyOrders[0] || null;
+  const topAsk = sellOrders[0] || null;
 
-setTimeout(monitorPrices, 3000);
+  const spread =
+    topBid && topAsk ? Math.abs(topAsk.price - topBid.price) : null;
+
+  const buyDepth = buyOrders.reduce((sum, o) => sum + o.size, 0);
+  const sellDepth = sellOrders.reduce((sum, o) => sum + o.size, 0);
+
+  const bidWall = getWall(buyOrders); // max size
+  const askWall = getWall(sellOrders);
+
+  return {
+    topBid,
+    topAsk,
+    spread,
+    buyDepth: Number(buyDepth.toFixed(2)),
+    sellDepth: Number(sellDepth.toFixed(2)),
+    bidWall,
+    askWall,
+    changes: [...buyChanges, ...sellChanges],
+    buyOrders,
+    sellOrders,
+  };
+}
 
 function extractNumericValue(text) {
   if (!text) return null;
@@ -229,4 +317,152 @@ function extractNumericValue(text) {
 
   // console.log('No numeric value found in:', cleanText);
   return null;
+}
+
+function parseTimeToEpoch(hhmmss) {
+  const [hh, mm, ss] = hhmmss.split(":").map(Number);
+  const now = new Date();
+  if (isNaN(hh) || isNaN(mm) || isNaN(ss)) return null;
+
+  now.setHours(hh, mm, ss, 0);
+  return now.getTime();
+}
+
+function getWall(orders = []) {
+  if (!orders.length) return null;
+
+  let maxOrder = orders[0];
+  for (const order of orders) {
+    if (order.size > maxOrder.size) {
+      maxOrder = order;
+    }
+  }
+  return maxOrder;
+}
+
+setTimeout(monitorPrices, 3000);
+
+function detectSpoofing(changes = []) {
+  const spoofThreshold = 5; // size ≥ 5 units (tune based on symbol)
+  const priceCounts = {};
+
+  for (const change of changes) {
+    if (
+      (change.type === "added" || change.type === "removed") &&
+      change.size >= spoofThreshold
+    ) {
+      const key = `${change.side}-${change.price}`;
+      priceCounts[key] = (priceCounts[key] || 0) + 1;
+    }
+  }
+
+  // If the same price saw both added + removed in same round, suspicious
+  const suspicious = Object.entries(priceCounts).some(
+    ([_, count]) => count > 1
+  );
+
+  return suspicious;
+}
+
+function detectWallMovement(changes = []) {
+  const wallSize = 5;
+  const wallMoves = changes.filter((c) => {
+    return (c.type === "removed" || c.type === "added") && c.size >= wallSize;
+  });
+
+  // You can get fancier later: check if price shifted multiple ticks
+  return wallMoves.length >= 2;
+}
+
+function extractHeaderStats() {
+  const header = document.querySelector("#header-placeholder");
+  if (!header) return {};
+
+  function getValue(labelText) {
+    const label = Array.from(header.querySelectorAll(".header-label")).find(
+      (el) => el.textContent.trim().includes(labelText)
+    );
+    if (!label) return null;
+    const valueEl = label.closest(".sc-kIPQKe")?.querySelector(".header-value");
+    return valueEl?.innerText.trim() || null;
+  }
+
+  return {
+    change24h: parsePercentage(getValue("24h Change")), // 0.0035
+    volume24h: parseDollarValue(getValue("24h Vol.")), // 531800000
+    openInterest: parseDollarValue(getValue("OI")), // 56900000
+    fundingRate: parseFundingRate(
+      document.querySelector(".funding-value")?.innerText
+    ),
+    estNextFunding: parseFundingRate(getValue("Est. Next Funding")),
+    nextFundingSeconds: parseCountdownToSeconds(getValue("Next Funding In")),
+    high24h: parseDollarValue(getValue("24h High")), // 114542.0
+    low24h: parseDollarValue(getValue("24h Low")), // 112597.5
+  };
+}
+
+const priceHistory = []; // global
+
+function detectMomentum(currentPrice) {
+  const now = Date.now();
+  priceHistory.push({ price: currentPrice, time: now });
+
+  // Keep only last 10 seconds
+  while (priceHistory.length && now - priceHistory[0].time > 10000) {
+    priceHistory.shift();
+  }
+
+  if (priceHistory.length < 2) return "flat";
+
+  const first = priceHistory[0].price;
+  const last = priceHistory[priceHistory.length - 1].price;
+  const change = last - first;
+  const pct = (change / first) * 100;
+
+  if (pct > 0.1) return "rising";
+  if (pct < -0.1) return "falling";
+  return "flat";
+}
+
+function parseDollarValue(valueStr) {
+  if (!valueStr) return 0;
+
+  valueStr = valueStr.replace(/[\$,]/g, "").trim().toUpperCase(); // "$531.8M" → "531.8M"
+
+  const multiplier = valueStr.endsWith("M")
+    ? 1_000_000
+    : valueStr.endsWith("B")
+    ? 1_000_000_000
+    : 1;
+
+  const number = parseFloat(valueStr);
+  return isNaN(number) ? 0 : number * multiplier;
+}
+
+function parseCountdownToSeconds(countdownStr) {
+  if (!countdownStr) return 0;
+
+  const regex = /(\d{1,2})h:(\d{1,2})m:(\d{1,2})s/;
+  const match = countdownStr.match(regex);
+
+  if (!match) return 0;
+
+  const [, h, m, s] = match.map(Number);
+  return h * 3600 + m * 60 + s;
+}
+
+function parsePercentage(percentStr, asFraction = false) {
+  if (!percentStr) return 0;
+
+  const num = parseFloat(percentStr.replace("%", "").trim());
+  if (isNaN(num)) return 0;
+
+  return asFraction ? num / 100 : num;
+}
+
+function parseFundingRate(rateStr) {
+  // "0.0100% /8h" → 0.0001
+  if (!rateStr) return 0;
+  const [percent] = rateStr.split("/");
+  return parsePercentage(percent);
 }
