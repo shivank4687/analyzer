@@ -1,0 +1,5 @@
+export enum MessageType {
+  PRICE_UPDATE = 'PRICE_UPDATE',
+  PRICE_UPDATED = 'PRICE_UPDATED',
+  GET_PRICE = 'GET_PRICE',
+}

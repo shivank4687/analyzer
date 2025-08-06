@@ -1,15 +1,14 @@
 {
   "manifest_version": 3,
-  "name": "My Angular Chrome Extension",
-  "description": "Extension built with Angular",
+  "name": "My Angular Extension",
   "version": "1.0",
   "permissions": ["scripting", "activeTab", "storage"],
   "action": {
     "default_popup": "index.html",
     "default_icon": {
-      "16": "assets/icon16.png",
-      "48": "assets/icon48.png",
-      "128": "assets/icon128.png"
+      "16": "assets/icons/icon16.svg",
+      "48": "assets/icons/icon48.svg",
+      "128": "assets/icons/icon128.svg"
     }
   },
   "background": {
