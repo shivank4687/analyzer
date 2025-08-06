@@ -1,1 +1,4 @@
-<div #chartContainer class="chart-container"></div>
+<div tvChart="Candlestick" [data]="candleData" [options]="chartOptions" (crosshairData)="onCrosshairData($event)">
+</div>
+<div tvChart="Histogram" [data]="indicatorData" tvChartCollector>
+</div>
